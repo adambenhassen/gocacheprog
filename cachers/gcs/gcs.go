@@ -19,7 +19,7 @@ import (
 const (
 	outputIDMetadataKey      = "outputid"
 	outputUncompressedLength = "content-length-raw"
-	binaryType               = "application/x-binary"
+	binaryType               = "application/octet-stream"
 )
 
 type GCSCache struct {
@@ -31,7 +31,12 @@ type GCSCache struct {
 	actioncacheMu sync.RWMutex
 }
 
-func NewCache(client *storage.Client, bucketName string, cacheKey string, verbose bool) *GCSCache {
+func NewCache(ctx context.Context, bucketName string, cacheKey string, verbose bool) *GCSCache {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		panic(err)
+	}
+
 	goos := os.Getenv("GOOS")
 	if goos == "" {
 		goos = runtime.GOOS
@@ -52,42 +57,42 @@ func NewCache(client *storage.Client, bucketName string, cacheKey string, verbos
 	return cache
 }
 
-func (s *GCSCache) Get(ctx context.Context, actionID string) (string, io.Reader, int, error) {
+func (s *GCSCache) Get(ctx context.Context, actionID string) (string, string, int64, io.ReadCloser, error) {
 	actionKey := s.actionKey(actionID)
 	object := s.client.Bucket(s.bucket).Object(actionKey)
 	reader, err := object.NewReader(ctx)
 	if errors.Is(err, storage.ErrObjectNotExist) {
-		return "", nil, 0, nil
+		return "", "", 0, nil, err
 	}
 
 	if err != nil {
-		return "", nil, 0, err
+		return "", "", 0, nil, err
 	}
 
 	attrs, err := object.Attrs(ctx)
 	if err != nil {
-		return "", nil, 0, err
+		return "", "", 0, nil, err
 	}
 
 	outputID, ok := attrs.Metadata[outputIDMetadataKey]
 	if !ok || outputID == "" {
-		return "", nil, 0, err
+		return "", "", 0, nil, err
 	}
 
 	sizeStr, ok := attrs.Metadata[outputUncompressedLength]
 	if !ok || sizeStr == "" {
-		return "", nil, 0, err
+		return "", "", 0, nil, err
 	}
 
-	size, err := strconv.Atoi(sizeStr)
+	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
-		return "", nil, 0, err
+		return "", "", 0, nil, err
 	}
 
-	return outputID, io.NopCloser(s2.NewReader(reader)), size, nil
+	return outputID, "", size, io.NopCloser(s2.NewReader(reader)), nil
 }
 
-func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) error {
+func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (string, error) {
 	var err error
 	actionKey := s.actionKey(actionID)
 
@@ -99,7 +104,7 @@ func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int6
 	_, ok := s.actioncache[actionID]
 	s.actioncacheMu.RUnlock()
 	if ok {
-		return nil
+		return "", nil
 	}
 
 	object := s.client.Bucket(s.bucket).Object(actionKey)
@@ -109,7 +114,7 @@ func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int6
 		s.actioncache[actionID] = struct{}{}
 		s.actioncacheMu.Unlock()
 		//s.Logf("-> PUT %s exists\n", actionID)
-		return nil
+		return "", nil
 	}
 
 	wc := object.NewWriter(ctx)
@@ -123,20 +128,20 @@ func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int6
 
 	_, err = io.Copy(wr, body)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	err = wr.Close()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	err = wc.Close()
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	return "", nil
 }
 
 func (s *GCSCache) actionKey(actionID string) string {

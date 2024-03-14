@@ -11,14 +11,13 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/adambenhassen/gocacheprog/cachers/gcs"
+	"github.com/adambenhassen/gocacheprog/cachers"
 	"github.com/adambenhassen/gocacheprog/utils"
 	"github.com/adambenhassen/gocacheprog/wire"
 )
@@ -31,26 +30,31 @@ var (
 )
 
 type Process struct {
-	cache         *gcs.GCSCache
+	local         cachers.Cache
+	remote        cachers.Cache
 	gwg           sync.WaitGroup
 	verbose       bool
 	dir           string
 	minUploadSize int64
 
+	gets        int64
 	hits_local  int64
 	hits_remote int64
 
-	miss int64
-	puts int64
+	miss         int64
+	puts         int64
+	puts_errored int64
+	puts_ignored int64
 }
 
-func NewCacheProc(cache *gcs.GCSCache, verbose bool, minUploadSize int64) *Process {
+func NewCacheProc(local, remote cachers.Cache, verbose bool, minUploadSize int64) *Process {
 	d, err := os.UserCacheDir()
 	if err != nil {
 		log.Fatal(err)
 	}
 	return &Process{
-		cache:         cache,
+		local:         local,
+		remote:        remote,
 		verbose:       verbose,
 		dir:           d,
 		minUploadSize: minUploadSize,
@@ -78,7 +82,8 @@ func (p *Process) Run(ctx context.Context) error {
 	defer func() {
 		wg.Wait()
 		p.gwg.Wait()
-		log.Printf("hits_local: %v, hits_remote: %v, misses: %v, puts: %v\n", p.hits_local, p.hits_remote, p.miss, p.puts)
+		log.Printf("gets %v, hits_local: %v, hits_remote: %v, misses_remote: %v, puts: %v, puts_errored %v, puts_ignored %v\n",
+			p.gets, p.hits_local, p.hits_remote, p.miss, p.puts, p.puts_errored, p.puts_ignored)
 	}()
 
 	for {
@@ -135,6 +140,7 @@ func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wir
 		return nil
 	case "get":
 		err := p.handleGet(ctx, req, res)
+		atomic.AddInt64(&p.gets, 1)
 		if res.Miss {
 			atomic.AddInt64(&p.miss, 1)
 		}
@@ -149,61 +155,39 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 	actionID := fmt.Sprintf("%x", req.ActionID)
 	start := time.Now()
 
-	actionFile := filepath.Join(p.dir, "gocacheprog", fmt.Sprintf("a-%s", actionID))
-	if _, err := os.Stat(actionFile); os.IsNotExist(err) {
-		outputID, reader, size, err := p.cache.Get(ctx, actionID)
+	_, outputPath, _, _, err := p.local.Get(ctx, actionID)
+	if err != nil {
+		outputID, _, size, reader, err := p.remote.Get(ctx, actionID)
 		if err != nil {
 			res.Miss = true
-			return err
+			// log.Printf("<- GET %s miss, took: %s\n", actionID, utils.FormatDuration(time.Since(start)))
+			return nil
 		}
-
-		took := time.Since(start)
 
 		if outputID == "" {
 			res.Miss = true
-			// log.Printf("<- GET %s miss, took: %s\n", actionID, utils.FormatDuration(took))
 			return nil
 		}
-		if p.verbose {
-			log.Printf("<- GET %s took: %s\n", actionID, utils.FormatDuration(took))
-		}
+
 		res.OutputID, err = hex.DecodeString(outputID)
 		if err != nil {
 			res.Miss = true
 			return fmt.Errorf("invalid OutputID: %w", err)
 		}
 
-		outputPath, err = savefile(actionID, outputID, int64(size), reader)
+		outputPath, err = p.local.Put(ctx, actionID, outputID, size, reader)
 		if err != nil {
 			res.Miss = true
 			return fmt.Errorf("unable to save to file: %w", err)
 		}
+
+		if p.verbose {
+			log.Printf("<- GET %s took: %s\n", actionID, utils.FormatDuration(time.Since(start)))
+		}
+
 		atomic.AddInt64(&p.hits_remote, 1)
 	} else {
-		ij, err := os.ReadFile(actionFile)
-		if err != nil {
-			if os.IsNotExist(err) {
-				err = nil
-			}
-			res.Miss = true
-			return err
-		}
-
-		var ie indexEntry
-		if err := json.Unmarshal(ij, &ie); err != nil {
-			res.Miss = true
-			log.Printf("Warning: JSON error for action %q: %v", actionID, err)
-			return nil
-		}
-
-		if _, err := hex.DecodeString(ie.OutputID); err != nil {
-			res.Miss = true
-			// Protect against malicious non-hex OutputID on disk
-			return nil
-		}
-
 		atomic.AddInt64(&p.hits_local, 1)
-		outputPath = filepath.Join(p.dir, "gocacheprog", fmt.Sprintf("o-%s", ie.OutputID))
 	}
 
 	fi, err := os.Stat(outputPath)
@@ -227,8 +211,8 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 	return nil
 }
 
-func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
-	ctx = context.Background()
+func (p *Process) handlePut(_ context.Context, req *wire.Request, res *wire.Response) (retErr error) {
+	ctx := context.Background()
 
 	actionID, objectID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.ObjectID)
 	defer func() {
@@ -246,7 +230,7 @@ func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Re
 		body = io.TeeReader(req.Body, &copyBuf)
 	}
 
-	diskPath, err := savefile(actionID, objectID, req.BodySize, body)
+	diskPath, err := p.local.Put(ctx, actionID, objectID, req.BodySize, body)
 	if err != nil {
 		return fmt.Errorf("unable to save to file: %w", err)
 	}
@@ -254,19 +238,22 @@ func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Re
 	res.Size = req.BodySize
 
 	start := time.Now()
-	if req.BodySize >= p.minUploadSize { // 10kb
+	atomic.AddInt64(&p.puts, 1)
+	if req.BodySize >= p.minUploadSize { // 15kb
 		p.gwg.Add(1)
 
 		go func() {
 			defer p.gwg.Done()
-			err = p.cache.Put(ctx, actionID, objectID, req.BodySize, &copyBuf)
+			_, err = p.remote.Put(ctx, actionID, objectID, req.BodySize, &copyBuf)
 			if err != nil {
-				atomic.AddInt64(&p.puts, 1)
-			}
-			if p.verbose {
-				log.Printf("-> PUT %s took: %s\n", actionID, utils.FormatDuration(time.Since(start)))
+				atomic.AddInt64(&p.puts_errored, 1)
+				log.Print(err)
+			} else if p.verbose {
+				log.Printf("-> PUT %s took: %s, size: %v\n", actionID, utils.FormatDuration(time.Since(start)), req.BodySize)
 			}
 		}()
+	} else {
+		atomic.AddInt64(&p.puts_ignored, 1)
 	}
 
 	return nil

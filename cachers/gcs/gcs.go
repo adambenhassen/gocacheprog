@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
 
 	"cloud.google.com/go/storage"
 	"github.com/klauspost/compress/s2"
@@ -22,10 +23,12 @@ const (
 )
 
 type GCSCache struct {
-	bucket  string
-	prefix  string
-	verbose bool
-	client  *storage.Client
+	bucket        string
+	prefix        string
+	verbose       bool
+	client        *storage.Client
+	actioncache   map[string]struct{}
+	actioncacheMu sync.RWMutex
 }
 
 func NewCache(client *storage.Client, bucketName string, cacheKey string, verbose bool) *GCSCache {
@@ -40,10 +43,11 @@ func NewCache(client *storage.Client, bucketName string, cacheKey string, verbos
 	}
 
 	cache := &GCSCache{
-		client:  client,
-		verbose: verbose,
-		bucket:  bucketName,
-		prefix:  fmt.Sprintf("cache/%s/%s/%s", cacheKey, goarch, goos),
+		client:      client,
+		verbose:     verbose,
+		bucket:      bucketName,
+		prefix:      fmt.Sprintf("cache/%s/%s/%s", cacheKey, goarch, goos),
+		actioncache: map[string]struct{}{},
 	}
 	return cache
 }
@@ -91,13 +95,24 @@ func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int6
 		body = bytes.NewReader(nil)
 	}
 
-	_, err = s.client.Bucket(s.bucket).Object(actionKey).Attrs(ctx)
-	if err == nil {
-		s.Logf("-> PUT %s exists\n", actionID)
+	s.actioncacheMu.RLock()
+	_, ok := s.actioncache[actionID]
+	s.actioncacheMu.RUnlock()
+	if ok {
 		return nil
 	}
 
-	wc := s.client.Bucket(s.bucket).Object(actionKey).NewWriter(ctx)
+	object := s.client.Bucket(s.bucket).Object(actionKey)
+	_, err = object.Attrs(ctx)
+	if err == nil {
+		s.actioncacheMu.Lock()
+		s.actioncache[actionID] = struct{}{}
+		s.actioncacheMu.Unlock()
+		//s.Logf("-> PUT %s exists\n", actionID)
+		return nil
+	}
+
+	wc := object.NewWriter(ctx)
 	wc.ContentType = binaryType
 	wc.Metadata = map[string]string{
 		outputIDMetadataKey:      outputID,

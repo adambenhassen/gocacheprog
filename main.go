@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	verbose  = flag.Bool("verbose", false, "be verbose")
-	bucket   = flag.String("bucket", "inigo-ci-cache", "bucket")
-	cacheKey = flag.String("cacheKey", "", "cacheKey")
+	verbose       = flag.Bool("verbose", false, "be verbose")
+	bucket        = flag.String("bucket", "inigo-ci-cache", "bucket")
+	cacheKey      = flag.String("cache-key", "", "cacheKey")
+	minUploadSize = flag.Int64("min-upload-size", 10_000, "minimum upload size")
 )
 
 func main() {
@@ -32,7 +33,7 @@ func main() {
 	}
 
 	cache := gcs.NewCache(client, *bucket, *cacheKey, *verbose)
-	proc.NewCacheProc(cache, *verbose).Run(ctx)
+	proc.NewCacheProc(cache, *verbose, *minUploadSize).Run(ctx)
 
 	if *verbose {
 		log.Println("took", utils.FormatDuration(time.Since(start)))

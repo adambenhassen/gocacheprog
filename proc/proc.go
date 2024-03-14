@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,17 +13,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	jsoniter "github.com/json-iterator/go"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/adambenhassen/gocacheprog/cachers/gcs"
 	"github.com/adambenhassen/gocacheprog/utils"
 	"github.com/adambenhassen/gocacheprog/wire"
 )
-
-var Json = jsoniter.ConfigDefault
 
 type cacherCtxKey string
 
@@ -32,15 +31,29 @@ var (
 )
 
 type Process struct {
-	cache   *gcs.GCSCache
-	gwg     sync.WaitGroup
-	verbose bool
+	cache         *gcs.GCSCache
+	gwg           sync.WaitGroup
+	verbose       bool
+	dir           string
+	minUploadSize int64
+
+	hits_local  int64
+	hits_remote int64
+
+	miss int64
+	puts int64
 }
 
-func NewCacheProc(cache *gcs.GCSCache, verbose bool) *Process {
+func NewCacheProc(cache *gcs.GCSCache, verbose bool, minUploadSize int64) *Process {
+	d, err := os.UserCacheDir()
+	if err != nil {
+		log.Fatal(err)
+	}
 	return &Process{
-		cache:   cache,
-		verbose: verbose,
+		cache:         cache,
+		verbose:       verbose,
+		dir:           d,
+		minUploadSize: minUploadSize,
 	}
 }
 
@@ -48,10 +61,10 @@ func (p *Process) Run(ctx context.Context) error {
 	var wmu sync.Mutex
 
 	br := bufio.NewReader(os.Stdin)
-	jd := Json.NewDecoder(br)
+	jd := json.NewDecoder(br)
 
 	bw := bufio.NewWriter(os.Stdout)
-	je := Json.NewEncoder(bw)
+	je := json.NewEncoder(bw)
 
 	caps := []wire.Cmd{"get", "put", "close"}
 	if err := je.Encode(&wire.Response{KnownCommands: caps}); err != nil {
@@ -65,6 +78,7 @@ func (p *Process) Run(ctx context.Context) error {
 	defer func() {
 		wg.Wait()
 		p.gwg.Wait()
+		log.Printf("hits_local: %v, hits_remote: %v, misses: %v, puts: %v\n", p.hits_local, p.hits_remote, p.miss, p.puts)
 	}()
 
 	for {
@@ -74,6 +88,10 @@ func (p *Process) Run(ctx context.Context) error {
 				return nil
 			}
 			return err
+		}
+
+		if req.Command != wire.CmdPut && req.Command != wire.CmdGet && req.Command != wire.CmdClose {
+			continue
 		}
 
 		if req.Command == wire.CmdPut && req.BodySize > 0 {
@@ -116,7 +134,11 @@ func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wir
 	case "close":
 		return nil
 	case "get":
-		return p.handleGet(ctx, req, res)
+		err := p.handleGet(ctx, req, res)
+		if res.Miss {
+			atomic.AddInt64(&p.miss, 1)
+		}
+		return err
 	case "put":
 		return p.handlePut(ctx, req, res)
 	}
@@ -127,14 +149,8 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 	actionID := fmt.Sprintf("%x", req.ActionID)
 	start := time.Now()
 
-	d, err := os.UserCacheDir()
-	if err != nil {
-		log.Fatal(err)
-	}
-	actionFile := filepath.Join(d, "gocacheprog", fmt.Sprintf("a-%s", actionID))
-
-	_, err = os.Stat(actionFile)
-	if err != nil && os.IsNotExist(err) {
+	actionFile := filepath.Join(p.dir, "gocacheprog", fmt.Sprintf("a-%s", actionID))
+	if _, err := os.Stat(actionFile); os.IsNotExist(err) {
 		outputID, reader, size, err := p.cache.Get(ctx, actionID)
 		if err != nil {
 			res.Miss = true
@@ -162,6 +178,7 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 			res.Miss = true
 			return fmt.Errorf("unable to save to file: %w", err)
 		}
+		atomic.AddInt64(&p.hits_remote, 1)
 	} else {
 		ij, err := os.ReadFile(actionFile)
 		if err != nil {
@@ -173,7 +190,7 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 		}
 
 		var ie indexEntry
-		if err := Json.Unmarshal(ij, &ie); err != nil {
+		if err := json.Unmarshal(ij, &ie); err != nil {
 			res.Miss = true
 			log.Printf("Warning: JSON error for action %q: %v", actionID, err)
 			return nil
@@ -185,7 +202,8 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 			return nil
 		}
 
-		outputPath = filepath.Join(d, "gocacheprog", fmt.Sprintf("o-%s", ie.OutputID))
+		atomic.AddInt64(&p.hits_local, 1)
+		outputPath = filepath.Join(p.dir, "gocacheprog", fmt.Sprintf("o-%s", ie.OutputID))
 	}
 
 	fi, err := os.Stat(outputPath)
@@ -210,8 +228,7 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 }
 
 func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	_ = cancel
+	ctx = context.Background()
 
 	actionID, objectID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.ObjectID)
 	defer func() {
@@ -236,18 +253,21 @@ func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Re
 	res.DiskPath = diskPath
 	res.Size = req.BodySize
 
-	p.gwg.Add(1)
-	go func() {
-		start := time.Now()
+	start := time.Now()
+	if req.BodySize >= p.minUploadSize { // 10kb
+		p.gwg.Add(1)
 
-		defer p.gwg.Done()
-		if err := p.cache.Put(ctx, actionID, objectID, req.BodySize, &copyBuf); err != nil {
-			log.Println(err.Error())
-		}
-		if p.verbose {
-			log.Printf("-> PUT %s took: %s\n", actionID, utils.FormatDuration(time.Since(start)))
-		}
-	}()
+		go func() {
+			defer p.gwg.Done()
+			err = p.cache.Put(ctx, actionID, objectID, req.BodySize, &copyBuf)
+			if err != nil {
+				atomic.AddInt64(&p.puts, 1)
+			}
+			if p.verbose {
+				log.Printf("-> PUT %s took: %s\n", actionID, utils.FormatDuration(time.Since(start)))
+			}
+		}()
+	}
 
 	return nil
 }

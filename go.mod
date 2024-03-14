@@ -4,7 +4,6 @@ go 1.22.1
 
 require (
 	cloud.google.com/go/storage v1.39.1
-	github.com/json-iterator/go v1.1.12
 	github.com/klauspost/compress v1.17.7
 	golang.org/x/sync v0.6.0
 )
@@ -23,8 +22,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.2 // indirect
 	github.com/googleapis/gax-go/v2 v2.12.2 // indirect
-	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
-	github.com/modern-go/reflect2 v1.0.2 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.48.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.48.0 // indirect

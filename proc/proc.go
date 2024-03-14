@@ -149,7 +149,7 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 			return nil
 		}
 		if p.verbose {
-			log.Printf("<- GET %s, took: %s\n", actionID, utils.FormatDuration(took))
+			log.Printf("<- GET %s took: %s\n", actionID, utils.FormatDuration(took))
 		}
 		res.OutputID, err = hex.DecodeString(outputID)
 		if err != nil {

@@ -116,6 +116,11 @@ func (s *GCSCache) Put(ctx context.Context, actionID, outputID string, size int6
 		return err
 	}
 
+	err = wc.Close()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
